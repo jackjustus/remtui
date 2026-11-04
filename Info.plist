@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.jackjustus.remtui</string>
+	<key>CFBundleName</key>
+	<string>remtui</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>remtui shows and edits your scheduled reminders in the terminal.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>remtui shows and edits your scheduled reminders in the terminal.</string>
+</dict>
+</plist>
