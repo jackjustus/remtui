@@ -151,6 +151,10 @@ enum Key {
     case char(Character)
     case up, down, left, right, home, end, pageUp, pageDown
     case enter, esc, backspace, delete, tab
+    case newline                  // ⌥↵ / ⇧↵ / ^J — literal line break in text fields
+    case wordLeft, wordRight      // ⌥← ⌥→ (also ESC b / ESC f, ⌃← ⌃→)
+    case wordBackspace, wordDelete // ⌥⌫ / ⌥⌦
+    case lineBackspace            // ⌘⌫
     case ctrl(UInt8)              // 1...26 → a...z
     case cmd(Character, Mods)     // any ⌘ combo; character is lowercase
 }
@@ -158,6 +162,14 @@ enum Key {
 /// Translate a kitty-protocol key code + modifiers into a Key.
 func keyFromCode(_ code: Int, _ mods: Mods) -> Key? {
     guard let scalar = UnicodeScalar(code) else { return nil }
+    switch code {
+    case 127, 8:
+        if mods.contains(.cmd) { return .lineBackspace }
+        if !mods.intersection([.alt, .ctrl]).isEmpty { return .wordBackspace }
+    case 13:
+        if !mods.intersection([.alt, .shift]).isEmpty { return .newline }
+    default: break
+    }
     if mods.contains(.cmd) {
         return .cmd(Character(String(Character(scalar)).lowercased()), mods)
     }
@@ -194,6 +206,15 @@ func readKey() -> Key? {
     switch b {
     case 27:
         guard let b2 = readByte(timeoutMs: 25) else { return .esc }
+        // Legacy meta sequences (Ghostty's default ⌥←/⌥→ send ESC b / ESC f).
+        switch b2 {
+        case UInt8(ascii: "b"): return .wordLeft
+        case UInt8(ascii: "f"): return .wordRight
+        case UInt8(ascii: "d"): return .wordDelete
+        case 127, 8: return .wordBackspace
+        case 13, 10: return .newline
+        default: break
+        }
         guard b2 == UInt8(ascii: "[") || b2 == UInt8(ascii: "O") else { return .esc }
         // Read CSI params up to the final byte (0x40–0x7E).
         var params = ""
@@ -215,22 +236,27 @@ func readKey() -> Key? {
             return keyFromCode(base ?? code, mods)
         case UInt8(ascii: "A"): return .up
         case UInt8(ascii: "B"): return .down
-        case UInt8(ascii: "C"): return .right
-        case UInt8(ascii: "D"): return .left
+        case UInt8(ascii: "C"):
+            if mods.contains(.cmd) { return .end }
+            return mods.intersection([.alt, .ctrl]).isEmpty ? .right : .wordRight
+        case UInt8(ascii: "D"):
+            if mods.contains(.cmd) { return .home }
+            return mods.intersection([.alt, .ctrl]).isEmpty ? .left : .wordLeft
         case UInt8(ascii: "H"): return .home
         case UInt8(ascii: "F"): return .end
         case UInt8(ascii: "~"):
             switch fields.first ?? "" {
             case "5": return .pageUp
             case "6": return .pageDown
-            case "3": return .delete
+            case "3": return mods.intersection([.alt, .ctrl]).isEmpty ? .delete : .wordDelete
             case "1", "7": return .home
             case "4", "8": return .end
             default: return nil
             }
         default: return nil
         }
-    case 13, 10: return .enter
+    case 13: return .enter
+    case 10: return .newline
     case 127, 8: return .backspace
     case 9: return .tab
     case 1...26: return .ctrl(b)
@@ -431,16 +457,105 @@ func priorityMark(_ p: Int) -> String {
     }
 }
 
+// MARK: - Text field
+
+/// Single-line-display editable text with a cursor and macOS-style motions.
+/// Notes may contain newlines; "line" motions respect them.
+struct Field {
+    var text: [Character]
+    var cursor: Int
+    var scroll = 0   // first visible character, maintained by the renderer
+
+    init(_ s: String) { text = Array(s); cursor = text.count }
+
+    var string: String { String(text) }
+
+    static func isWord(_ c: Character) -> Bool { c.isLetter || c.isNumber || c == "_" || c == "'" }
+
+    var wordStartBefore: Int {
+        var i = cursor
+        while i > 0, !Field.isWord(text[i - 1]) { i -= 1 }
+        while i > 0, Field.isWord(text[i - 1]) { i -= 1 }
+        return i
+    }
+    var wordEndAfter: Int {
+        var i = cursor
+        while i < text.count, !Field.isWord(text[i]) { i += 1 }
+        while i < text.count, Field.isWord(text[i]) { i += 1 }
+        return i
+    }
+    var lineStart: Int {
+        var i = cursor
+        while i > 0, text[i - 1] != "\n" { i -= 1 }
+        return i
+    }
+    var lineEnd: Int {
+        var i = cursor
+        while i < text.count, text[i] != "\n" { i += 1 }
+        return i
+    }
+
+    mutating func insert(_ c: Character) { text.insert(c, at: cursor); cursor += 1 }
+    mutating func move(to i: Int) { cursor = max(0, min(text.count, i)) }
+    mutating func deleteRange(_ a: Int, _ b: Int) {
+        let lo = max(0, min(a, b)), hi = min(text.count, max(a, b))
+        guard lo < hi else { return }
+        text.removeSubrange(lo..<hi)
+        cursor = lo
+    }
+
+    /// Apply an editing/motion key. Returns false if the key isn't a field key.
+    mutating func handle(_ key: Key, multiline: Bool) -> Bool {
+        switch key {
+        case .char(let c): insert(c)
+        case .newline: if multiline { insert("\n") }
+        case .left, .ctrl(2): move(to: cursor - 1)            // ← ^B
+        case .right, .ctrl(6): move(to: cursor + 1)           // → ^F
+        case .wordLeft: move(to: wordStartBefore)
+        case .wordRight: move(to: wordEndAfter)
+        case .home, .ctrl(1):                                 // ⌘← ^A
+            move(to: cursor == lineStart && multiline ? 0 : lineStart)
+        case .end, .ctrl(5):                                  // ⌘→ ^E
+            move(to: cursor == lineEnd && multiline ? text.count : lineEnd)
+        case .backspace: deleteRange(cursor - 1, cursor)
+        case .delete, .ctrl(4): deleteRange(cursor, cursor + 1) // ⌦ ^D
+        case .wordBackspace, .ctrl(23): deleteRange(wordStartBefore, cursor) // ⌥⌫ ^W
+        case .wordDelete: deleteRange(cursor, wordEndAfter)
+        case .lineBackspace, .ctrl(21):                      // ⌘⌫ ^U
+            deleteRange(cursor == lineStart ? cursor - 1 : lineStart, cursor)
+        case .ctrl(11): deleteRange(cursor, cursor == lineEnd ? cursor + 1 : lineEnd) // ^K
+        default: return false
+        }
+        return true
+    }
+}
+
 // MARK: - App
 
 final class App {
     enum InputKind { case add, edit }
-    enum Mode { case normal, input(InputKind, String), confirmDelete }
+    enum Mode { case normal, input, confirmDelete(EKReminder) }
     enum Row { case header(Section), item(Int), notes(String), blank }
+
+    struct Editor {
+        enum Focus { case title, notes }
+        let kind: InputKind
+        let target: EKReminder?   // the reminder being edited (nil when adding)
+        var title: Field
+        var notes: Field
+        var focus = Focus.title
+    }
+
+    /// Like Reminders.app: a just-checked reminder stays visible (struck
+    /// through) until you pause for this long, then it's hidden — unless
+    /// "show completed" is on. Each new completion restarts the countdown.
+    static let doneLinger: TimeInterval = 3
 
     let store: EKEventStore
     var items: [Item] = []
-    var sessionDone: Set<String> = []   // completed this session; stay visible (struck through)
+    var sessionDone: Set<String> = []   // just completed; linger until doneClear fires
+    var doneClear: DispatchWorkItem?
+    var editor: Editor?
     var sel = 0
     var scroll = 0
     var mode: Mode = .normal
@@ -533,12 +648,27 @@ final class App {
         guard save(r) else { r.isCompleted.toggle(); return }
         if r.isCompleted {
             sessionDone.insert(it.id)
+            scheduleDoneClear()
             flash("Completed “\(r.title ?? "")”")
         } else {
             sessionDone.remove(it.id)
             flash("Marked “\(r.title ?? "")” incomplete", Gruv.yellow)
         }
         reload()
+    }
+
+    /// Hide lingering completed reminders once the user pauses. Waits while
+    /// an edit or delete prompt is open so rows don't shift under it.
+    func scheduleDoneClear(after delay: TimeInterval = App.doneLinger) {
+        doneClear?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.sessionDone.isEmpty else { return }
+            guard case .normal = self.mode else { self.scheduleDoneClear(after: 1); return }
+            self.sessionDone.removeAll()
+            self.reload()
+        }
+        doneClear = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func shift(days: Int) {
@@ -583,21 +713,33 @@ final class App {
         reload()
     }
 
-    func delete() {
-        guard let it = current else { return }
+    func delete(_ r: EKReminder) {
         do {
-            try store.remove(it.reminder, commit: true)
-            sessionDone.remove(it.id)
-            flash("Deleted “\(it.reminder.title ?? "")”", Gruv.red)
+            try store.remove(r, commit: true)
+            sessionDone.remove(r.calendarItemIdentifier)
+            flash("Deleted “\(r.title ?? "")”", Gruv.red)
         } catch {
             flash(error.localizedDescription, Gruv.red)
         }
         reload()
     }
 
-    func submit(_ kind: InputKind, _ text: String) {
-        let p = parseEntry(text)
-        switch kind {
+    func beginAdd() {
+        editor = Editor(kind: .add, target: nil, title: Field(""), notes: Field(""))
+        mode = .input
+    }
+
+    func beginEdit() {
+        guard let r = current?.reminder else { return }
+        editor = Editor(kind: .edit, target: r, title: Field(r.title ?? ""), notes: Field(r.notes ?? ""))
+        mode = .input
+    }
+
+    func submit(_ ed: Editor) {
+        let p = parseEntry(ed.title.string)
+        let notesText = ed.notes.string
+        let notes: String? = notesText.trimmed.isEmpty ? nil : notesText
+        switch ed.kind {
         case .add:
             guard !p.title.isEmpty else { return }
             guard let list = store.defaultCalendarForNewReminders() else {
@@ -605,6 +747,7 @@ final class App {
             }
             let r = EKReminder(eventStore: store)
             r.title = p.title
+            r.notes = notes
             r.calendar = list
             let date = p.date ?? Date()
             let allDay = p.date == nil ? true : p.allDay
@@ -613,12 +756,12 @@ final class App {
             pendingSelect = r.calendarItemIdentifier
             flash("Added “\(p.title)” · \(describeDue(date, allDay: allDay))")
         case .edit:
-            guard let it = current else { return }
-            let r = it.reminder
+            guard let r = ed.target else { return }
             if !p.title.isEmpty { r.title = p.title }
             if let d = p.date { setDue(r, d, allDay: p.allDay) }
+            if notes != r.notes { r.notes = notes }
             guard save(r) else { return }
-            pendingSelect = it.id
+            pendingSelect = r.calendarItemIdentifier
             flash("Updated “\(r.title ?? "")”")
         }
         reload()
@@ -634,26 +777,30 @@ final class App {
     func handle(_ key: Key) {
         switch mode {
         case .normal: handleNormal(key)
-        case .confirmDelete:
+        case .confirmDelete(let r):
             mode = .normal
-            if case .char(let c) = key, c == "y" || c == "Y" { delete() } else { render() }
-        case .input(let kind, var buf):
+            if case .char(let c) = key, c == "y" || c == "Y" { delete(r) } else { render() }
+        case .input:
+            guard var ed = editor else { mode = .normal; render(); return }
             switch key {
-            case .esc, .ctrl(3): mode = .normal
+            case .esc, .ctrl(3):
+                mode = .normal
+                editor = nil
             case .enter:
                 mode = .normal
-                submit(kind, buf)
+                editor = nil
+                submit(ed)
                 return
-            case .backspace: if !buf.isEmpty { buf.removeLast() }; mode = .input(kind, buf)
-            case .ctrl(21): mode = .input(kind, "")   // ^U
-            case .ctrl(23):                            // ^W
-                var s = buf
-                while s.last == " " { s.removeLast() }
-                while let l = s.last, l != " " { s.removeLast() }
-                mode = .input(kind, s)
-            case .char(let c): buf.append(c); mode = .input(kind, buf)
-            default: break
+            case .tab: ed.focus = ed.focus == .title ? .notes : .title
+            case .down: ed.focus = .notes
+            case .up: ed.focus = .title
+            default:
+                switch ed.focus {
+                case .title: _ = ed.title.handle(key, multiline: false)
+                case .notes: _ = ed.notes.handle(key, multiline: true)
+                }
             }
+            if case .input = mode { editor = ed }
             render()
         }
     }
@@ -670,8 +817,8 @@ final class App {
     /// Reminders.app's default shortcuts (the ones EventKit can support).
     func handleCmd(_ c: Character, _ m: Mods) {
         switch comboName(c, m) {
-        case "⌘N": mode = .input(.add, "")
-        case "⌘I": if let it = current { mode = .input(.edit, it.reminder.title ?? "") }
+        case "⌘N": beginAdd()
+        case "⌘I": beginEdit()
         case "⌘T": setDay(Relative.today()); return
         case "⌥⌘T": setDay(Relative.tomorrow()); return
         case "⌃⌘T": overdueToToday(); return
@@ -692,9 +839,9 @@ final class App {
         switch key {
         case .cmd(let c, let m): handleCmd(c, m); return
         case .char("?"): showHelp = true
-        case .backspace, .delete:
-            guard current != nil else { return }
-            mode = .confirmDelete
+        case .backspace, .delete, .char("x"), .char("d"):
+            guard let r = current?.reminder else { return }
+            mode = .confirmDelete(r)
         case .char("q"), .ctrl(3), .esc: quit()
         case .char("j"), .down: sel = min(sel + 1, items.count - 1)
         case .char("k"), .up: sel = max(sel - 1, 0)
@@ -703,15 +850,12 @@ final class App {
         case .ctrl(4), .pageDown: sel = min(sel + max(1, bodyHeight / 2), items.count - 1)
         case .ctrl(21), .pageUp: sel = max(sel - max(1, bodyHeight / 2), 0)
         case .char(" "): toggleDone(); return
-        case .char("a"), .char("n"): mode = .input(.add, "")
+        case .char("a"), .char("n"): beginAdd()
         case .char("e"), .enter:
-            guard let it = current else { return }
-            mode = .input(.edit, it.reminder.title ?? "")
+            guard current != nil else { return }
+            beginEdit()
         case .char("+"), .char("="), .char("l"), .right: shift(days: 1); return
         case .char("-"), .char("_"), .char("h"), .left: shift(days: -1); return
-        case .char("x"), .char("d"):
-            guard current != nil else { return }
-            mode = .confirmDelete
         case .char("r"): reload(); flash("Refreshed", Gruv.fg4); return
         default: return
         }
@@ -761,7 +905,9 @@ final class App {
         lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
 
         // ── body
-        bodyHeight = max(1, H - lines.count - 3)
+        var footerH = 3   // separator + 2 lines (3 lines of fields + hint when editing)
+        if case .input = mode { footerH = 4 }
+        bodyHeight = max(1, H - lines.count - footerH)
         let rows = buildRows()
         if showHelp {
             let groups: [(String, [(String, String)])] = [
@@ -775,6 +921,11 @@ final class App {
                     ("j k ↑ ↓", "move"), ("g G", "top / bottom"), ("^D ^U", "half page"),
                     ("space", "complete"), ("a e", "add / edit"), ("+ -", "±1 day"),
                     ("x", "delete"), ("r", "refresh"), ("q", "quit"),
+                ]),
+                ("While editing", [
+                    ("tab ↑ ↓", "switch title / notes"), ("← →", "move cursor"),
+                    ("⌥← ⌥→", "by word"), ("⌘← ⌘→", "line start / end (^A ^E)"),
+                    ("⌥⌫ ⌘⌫", "delete word / to line start"), ("⌥↵ ^J", "newline in notes"),
                 ]),
             ]
             for (gi, g) in groups.enumerated() {
@@ -808,8 +959,8 @@ final class App {
                 lines.append(sp(pad) + line(for: row, inner: inner, listW: listW, now: now))
             }
         }
-        while lines.count < H - 3 { lines.append("") }
-        if lines.count > H - 3 { lines = Array(lines.prefix(H - 3)) }
+        while lines.count < H - footerH { lines.append("") }
+        if lines.count > H - footerH { lines = Array(lines.prefix(max(0, H - footerH))) }
 
         // ── footer
         lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
@@ -821,17 +972,36 @@ final class App {
                                           ("⌘K", "weekend"), ("⇧⌘H", "completed"), ("⌫", "delete"),
                                           ("?", "help")],
                                          width: inner))
-        case .confirmDelete:
-            let name = current?.reminder.title ?? ""
+        case .confirmDelete(let r):
+            let name = r.title ?? ""
             lines.append(sp(pad) + paint("Delete “\(name.clip(inner - 20))”? ", Gruv.red, Style.bold)
                          + paint("y", Gruv.yellow) + paint("/", Gruv.gray) + paint("n", Gruv.yellow))
             lines.append("")
-        case .input(let kind, let buf):
-            let label = kind == .add ? "New › " : "Edit › "
-            let shown = String(buf.suffix(max(1, inner - label.count - 1)))
-            lines.append(sp(pad) + paint(label, Gruv.orange, Style.bold) + paint(shown, Gruv.fg))
-            cursor = (lines.count, pad + label.count + shown.count + 1)
-            let p = parseEntry(buf)
+        case .input:
+            guard var ed = editor else { break }
+            let kind = ed.kind
+            let titleLabel = kind == .add ? "New   › " : "Edit  › "
+            let notesLabel = "Notes › "
+            let fieldW = max(1, inner - titleLabel.count - 1)
+
+            /// Draw one field; keeps the cursor inside the visible window.
+            func draw(_ f: inout Field, label: String, focused: Bool, placeholder: String) -> String {
+                if f.cursor < f.scroll { f.scroll = f.cursor }
+                if f.cursor > f.scroll + fieldW - 1 { f.scroll = f.cursor - fieldW + 1 }
+                f.scroll = max(0, min(f.scroll, max(0, f.text.count - fieldW + 1)))
+                let shown = String(f.text.dropFirst(f.scroll).prefix(fieldW).map { $0 == "\n" ? "↵" : $0 })
+                let labelStyled = focused ? paint(label, Gruv.orange, Style.bold) : paint(label, Gruv.gray)
+                let body = f.text.isEmpty && !focused ? paint(placeholder, Gruv.bg3, Style.italic)
+                                                      : paint(shown, focused ? Gruv.fg : Gruv.fg4)
+                if focused { cursor = (lines.count + 1, pad + label.count + (f.cursor - f.scroll) + 1) }
+                return sp(pad) + labelStyled + body
+            }
+            lines.append(draw(&ed.title, label: titleLabel, focused: ed.focus == .title, placeholder: ""))
+            lines.append(draw(&ed.notes, label: notesLabel, focused: ed.focus == .notes,
+                              placeholder: "add notes (tab)"))
+            editor = ed
+
+            let p = parseEntry(ed.title.string)
             var preview: String
             if let d = p.date {
                 preview = paint("due ", Gruv.gray) + paint(describeDue(d, allDay: p.allDay), Gruv.aqua)
@@ -844,7 +1014,8 @@ final class App {
             if kind == .add, let list = store.defaultCalendarForNewReminders() {
                 preview += paint("  in ", Gruv.gray) + paint(list.title, color(for: list))
             }
-            preview += paint("   enter save · esc cancel", Gruv.bg3)
+            preview += paint(ed.focus == .notes ? "   ⌥↵ newline · enter save · esc cancel"
+                                                : "   tab notes · enter save · esc cancel", Gruv.bg3)
             lines.append(sp(pad) + preview)
         }
 
