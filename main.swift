@@ -365,6 +365,141 @@ func section(for d: Date, now: Date = Date(), history: Bool = false) -> Section 
     }
 }
 
+// MARK: - Recurrence
+
+/// A standard repeat, as offered by Reminders.app (minus hourly, which
+/// EventKit can't express).
+struct RepeatPreset: Equatable {
+    let label: String
+    let short: String      // for the row's repeat column on narrow terminals
+    let freq: EKRecurrenceFrequency
+    var interval = 1
+    var days: [Int] = []   // EKWeekday raw values (Sunday = 1); empty = the due date's own day
+
+    static let all: [RepeatPreset] = [
+        .init(label: "Daily", short: "daily", freq: .daily),
+        .init(label: "Weekdays", short: "wkdays", freq: .weekly, days: [2, 3, 4, 5, 6]),
+        .init(label: "Weekends", short: "wkends", freq: .weekly, days: [1, 7]),
+        .init(label: "Weekly", short: "weekly", freq: .weekly),
+        .init(label: "Every 2 weeks", short: "2 wks", freq: .weekly, interval: 2),
+        .init(label: "Monthly", short: "monthly", freq: .monthly),
+        .init(label: "Every 3 months", short: "3 mos", freq: .monthly, interval: 3),
+        .init(label: "Every 6 months", short: "6 mos", freq: .monthly, interval: 6),
+        .init(label: "Yearly", short: "yearly", freq: .yearly),
+    ]
+
+    var rule: EKRecurrenceRule {
+        EKRecurrenceRule(recurrenceWith: freq, interval: interval,
+                         daysOfTheWeek: days.isEmpty ? nil : days.compactMap { EKWeekday(rawValue: $0).map(EKRecurrenceDayOfWeek.init) },
+                         daysOfTheMonth: nil, monthsOfTheYear: nil, weeksOfTheYear: nil,
+                         daysOfTheYear: nil, setPositions: nil, end: nil)
+    }
+
+    /// Whether an existing rule is this preset. A rule with no days, or just
+    /// one day (how some clients spell "on the due date's day"), counts as
+    /// the day-less preset.
+    func matches(_ r: EKRecurrenceRule) -> Bool {
+        guard r.frequency == freq, r.interval == interval, r.recurrenceEnd == nil else { return false }
+        // EventKit pins monthly/yearly rules to the due date itself: a single
+        // day/month, or — for the 29th–31st — "e.g. 28th/29th, last that
+        // exists" (setPositions [-1]). Anything beyond that is a custom rule.
+        let pinned = (r.daysOfTheMonth?.count ?? 0) <= 1 || r.setPositions == [-1]
+        guard pinned, (r.monthsOfTheYear?.count ?? 0) <= 1,
+              r.setPositions == nil || r.setPositions == [-1] else { return false }
+        let rd = (r.daysOfTheWeek ?? []).filter { $0.weekNumber == 0 }.map { $0.dayOfTheWeek.rawValue }.sorted()
+        guard rd.count == (r.daysOfTheWeek?.count ?? 0) else { return false }
+        return days.isEmpty ? rd.count <= 1 : rd == days
+    }
+
+    static func matching(_ r: EKRecurrenceRule) -> RepeatPreset? { all.first { $0.matches(r) } }
+}
+
+/// Choices on the editor's Repeat line. `.keep` holds a rule made elsewhere
+/// (e.g. "every Mon, Wed" from Reminders.app) that the presets can't express,
+/// so editing such a reminder doesn't silently drop it.
+enum RepeatOption: Equatable {
+    case once, preset(RepeatPreset), keep(EKRecurrenceRule)
+
+    /// The options for a reminder (nil = new) and which one is current.
+    static func options(for r: EKReminder?) -> (opts: [RepeatOption], index: Int) {
+        let base = [RepeatOption.once] + RepeatPreset.all.map(RepeatOption.preset)
+        guard let rule = r?.recurrenceRules?.first else { return (base, 0) }
+        if let p = RepeatPreset.matching(rule), let i = base.firstIndex(of: .preset(p)) { return (base, i) }
+        return ([.keep(rule)] + base, 0)
+    }
+
+    var label: String {
+        switch self {
+        case .once: return "One time"
+        case .preset(let p): return p.label
+        case .keep(let rule): return Recur.describe(rule)
+        }
+    }
+
+    var repeats: Bool { self != .once }
+
+    func apply(to r: EKReminder) {
+        switch self {
+        case .once:
+            if r.hasRecurrenceRules { r.recurrenceRules = nil }
+        case .preset(let p):
+            if !(r.recurrenceRules?.first.map(p.matches) ?? false) { r.recurrenceRules = [p.rule] }
+            // Weekdays/Weekends must start on one of their days: move the
+            // due date forward (keeping the time) if it's on another day.
+            if !p.days.isEmpty, let it = Item(r) {
+                let cal = Calendar.current
+                for i in 0..<7 {
+                    guard let d = cal.date(byAdding: .day, value: i, to: it.due) else { break }
+                    if p.days.contains(cal.component(.weekday, from: d)) {
+                        if i > 0 { setDue(r, d, allDay: it.allDay) }
+                        break
+                    }
+                }
+            }
+        case .keep: break
+        }
+    }
+}
+
+enum Recur {
+    /// "weekly", "every 2 weeks on Mon, Thu", "every weekday", "monthly until Dec 31".
+    static func describe(_ r: EKRecurrenceRule) -> String {
+        if let p = RepeatPreset.matching(r) { return p.label.lowercased() }
+        let n = r.interval
+        let (unit, adverb): (String, String)
+        switch r.frequency {
+        case .daily: (unit, adverb) = ("day", "daily")
+        case .weekly: (unit, adverb) = ("week", "weekly")
+        case .monthly: (unit, adverb) = ("month", "monthly")
+        default: (unit, adverb) = ("year", "yearly")
+        }
+        let days = (r.daysOfTheWeek ?? []).filter { $0.weekNumber == 0 }.map { $0.dayOfTheWeek.rawValue }.sorted()
+        var s: String
+        if r.frequency == .weekly && n == 1 && days == [2, 3, 4, 5, 6] {
+            s = "every weekday"
+        } else if r.frequency == .weekly && n == 1 && days == [1, 7] {
+            s = "every weekend"
+        } else if r.frequency == .weekly && !days.isEmpty {
+            let names = days.map { Calendar.current.shortWeekdaySymbols[$0 - 1] }.joined(separator: ", ")
+            s = n == 1 ? "every \(names)" : "every \(n) weeks on \(names)"
+        } else {
+            s = n == 1 ? adverb : "every \(n) \(unit)s"
+        }
+        if let e = r.recurrenceEnd {
+            if let d = e.endDate { s += " until " + Fmt.monthDay.string(from: d) }
+            else if e.occurrenceCount > 0 { s += ", \(e.occurrenceCount) times" }
+        }
+        return s
+    }
+
+    static func describe(_ r: EKReminder) -> String? { r.recurrenceRules?.first.map(describe) }
+
+    /// Compact form for narrow rows: "wkdays", "2 wks", or "custom".
+    static func short(_ r: EKReminder) -> String? {
+        r.recurrenceRules?.first.map { RepeatPreset.matching($0)?.short ?? "custom" }
+    }
+}
+
 struct Parsed {
     var title: String
     var date: Date?
@@ -580,15 +715,32 @@ struct Field {
 final class App {
     enum InputKind { case add, edit }
     enum Mode { case normal, input, confirmDelete(EKReminder) }
-    enum Row { case header(Section), item(Int), notes(String), blank }
+    enum Row {
+        case header(Section), item(Int), notes(String), blank
+    }
 
     struct Editor {
-        enum Focus { case title, notes }
+        enum Focus { case title, notes, repeats }
         let kind: InputKind
         let target: EKReminder?   // the reminder being edited (nil when adding)
         var title: Field
         var notes: Field
         var focus = Focus.title
+        var repeatOpts: [RepeatOption]
+        var repeatIdx: Int
+        var repeatChoice: RepeatOption { repeatOpts[repeatIdx] }
+
+        init(kind: InputKind, target: EKReminder?) {
+            self.kind = kind
+            self.target = target
+            title = Field(target?.title ?? "")
+            notes = Field(target?.notes ?? "")
+            (repeatOpts, repeatIdx) = RepeatOption.options(for: target)
+        }
+
+        mutating func rotateRepeat(_ d: Int) {
+            repeatIdx = (repeatIdx + d + repeatOpts.count) % repeatOpts.count
+        }
     }
 
     /// Like Reminders.app: a just-checked reminder stays visible (struck
@@ -693,9 +845,18 @@ final class App {
     func toggleDone() {
         guard let it = current else { return }
         let r = it.reminder
+        let recurring = r.hasRecurrenceRules && !r.isCompleted
         r.isCompleted.toggle()
         guard save(r) else { r.isCompleted.toggle(); return }
-        if r.isCompleted {
+        if recurring {
+            // EventKit splits off a completed copy and rolls this reminder
+            // (same ID, still incomplete) forward to its next occurrence.
+            // Keep the cursor where it was instead of following it.
+            pendingSelect = items.indices.contains(sel + 1) ? items[sel + 1].id
+                          : sel > 0 ? items[sel - 1].id : nil
+            let next = Item(r).map { " · next " + describeDue($0.due, allDay: $0.allDay) } ?? ""
+            flash("Completed “\(r.title ?? "")”\(next)")
+        } else if r.isCompleted {
             sessionDone.insert(it.id)
             scheduleDoneClear()
             flash("Completed “\(r.title ?? "")”")
@@ -762,6 +923,21 @@ final class App {
         reload()
     }
 
+    /// R — step the selected reminder to the next repeat option.
+    func cycleRepeat() {
+        guard let it = current else { return }
+        let r = it.reminder
+        guard !r.isCompleted else { flash("Completed reminders can't repeat", Gruv.fg4); return }
+        let (opts, i) = RepeatOption.options(for: r)
+        let next = opts[(i + 1) % opts.count]
+        let old = r.recurrenceRules
+        next.apply(to: r)
+        guard save(r) else { r.recurrenceRules = old; return }
+        pendingSelect = it.id
+        flash(next.repeats ? "↻ Repeats \(next.label.lowercased())" : "No longer repeats", Gruv.aqua)
+        reload()
+    }
+
     func delete(_ r: EKReminder) {
         do {
             try store.remove(r, commit: true)
@@ -774,13 +950,13 @@ final class App {
     }
 
     func beginAdd() {
-        editor = Editor(kind: .add, target: nil, title: Field(""), notes: Field(""))
+        editor = Editor(kind: .add, target: nil)
         mode = .input
     }
 
     func beginEdit() {
         guard let r = current?.reminder else { return }
-        editor = Editor(kind: .edit, target: r, title: Field(r.title ?? ""), notes: Field(r.notes ?? ""))
+        editor = Editor(kind: .edit, target: r)
         mode = .input
     }
 
@@ -788,6 +964,8 @@ final class App {
         let p = parseEntry(ed.title.string)
         let notesText = ed.notes.string
         let notes: String? = notesText.trimmed.isEmpty ? nil : notesText
+        let choice = ed.repeatChoice
+        let repeatNote = choice.repeats ? " · ↻ \(choice.label.lowercased())" : ""
         switch ed.kind {
         case .add:
             guard !p.title.isEmpty else { return }
@@ -801,17 +979,21 @@ final class App {
             let date = p.date ?? Date()
             let allDay = p.date == nil ? true : p.allDay
             setDue(r, date, allDay: allDay)
+            choice.apply(to: r)
             guard save(r) else { return }
             pendingSelect = r.calendarItemIdentifier
-            flash("Added “\(p.title)” · \(describeDue(date, allDay: allDay))")
+            let due = Item(r).map { describeDue($0.due, allDay: $0.allDay) } ?? ""   // may have moved (Weekdays/Weekends)
+            flash("Added “\(p.title)” · \(due)\(repeatNote)")
         case .edit:
             guard let r = ed.target else { return }
             if !p.title.isEmpty { r.title = p.title }
             if let d = p.date { setDue(r, d, allDay: p.allDay) }
+            let hadRepeat = r.hasRecurrenceRules
+            choice.apply(to: r)
             if notes != r.notes { r.notes = notes }
             guard save(r) else { return }
             pendingSelect = r.calendarItemIdentifier
-            flash("Updated “\(r.title ?? "")”")
+            flash("Updated “\(r.title ?? "")”" + (hadRepeat && !choice.repeats ? " · no longer repeats" : repeatNote))
         }
         reload()
     }
@@ -840,16 +1022,29 @@ final class App {
                 editor = nil
                 submit(ed)
                 return
-            case .tab: ed.focus = ed.focus == .title ? .notes : .title
+            case .tab:
+                switch ed.focus {
+                case .title: ed.focus = .notes
+                case .notes: ed.focus = .repeats
+                case .repeats: ed.focus = .title
+                }
             case .down where ed.focus == .title: ed.focus = .notes
+            case .down where ed.focus == .notes:
+                if !ed.notes.moveLine(1, width: noteFieldWidth) { ed.focus = .repeats }
             case .up where ed.focus == .notes:
                 if !ed.notes.moveLine(-1, width: noteFieldWidth) { ed.focus = .title }
-            case .down: _ = ed.notes.moveLine(1, width: noteFieldWidth)
-            case .up: break
+            case .up where ed.focus == .repeats: ed.focus = .notes
+            case .up, .down: break
             default:
                 switch ed.focus {
                 case .title: _ = ed.title.handle(key, multiline: false)
                 case .notes: _ = ed.notes.handle(key, multiline: true)
+                case .repeats:
+                    switch key {
+                    case .char(" "), .right, .char("l"): ed.rotateRepeat(1)
+                    case .left, .char("h"): ed.rotateRepeat(-1)
+                    default: break
+                    }
                 }
             }
             if case .input = mode { editor = ed }
@@ -909,6 +1104,7 @@ final class App {
         case .char("+"), .char("="), .char("l"), .right: shift(days: 1); return
         case .char("-"), .char("_"), .char("h"), .left: shift(days: -1); return
         case .char("r"): reload(); flash("Refreshed", Gruv.fg4); return
+        case .char("R"): cycleRepeat(); return
         default: return
         }
         sel = max(0, sel)
@@ -963,11 +1159,11 @@ final class App {
         lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
 
         // ── body
-        var footerH = 3   // separator + 2 lines (title, notes lines + hint when editing)
-        noteFieldWidth = max(1, inner - 8 - 1)   // 8 = label width ("Notes › ")
+        var footerH = 3   // separator + 2 lines (title, notes lines + repeat + hint when editing)
+        noteFieldWidth = max(1, inner - 9 - 1)   // 9 = label width ("Notes  › ")
         if case .input = mode, let ed = editor {
             let n = wrapRanges(ed.notes.text, width: noteFieldWidth).count
-            footerH = 3 + min(App.maxNoteFieldRows, max(1, n))
+            footerH = 4 + min(App.maxNoteFieldRows, max(1, n))
         }
         bodyHeight = max(1, H - lines.count - footerH)
         notesWidth = max(1, inner - 6)
@@ -983,10 +1179,11 @@ final class App {
                 ("Terminal extras", [
                     ("j k ↑ ↓", "move"), ("g G", "top / bottom"), ("^D ^U", "half page"),
                     ("space", "complete"), ("a e", "add / edit"), ("+ -", "±1 day"),
+                    ("R", "next repeat option (one time, daily, weekly, …)"),
                     ("x", "delete"), ("r", "refresh"), ("q", "quit"),
                 ]),
                 ("While editing", [
-                    ("tab ↑ ↓", "switch title / notes"), ("← →", "move cursor"),
+                    ("tab ↑ ↓", "switch title / notes / repeat"), ("space ← →", "change repeat"), ("← →", "move cursor"),
                     ("⌥← ⌥→", "by word"), ("⌘← ⌘→", "line start / end (^A ^E)"),
                     ("⌥⌫ ⌘⌫", "delete word / to line start"), ("⌥↵ ^J", "newline in notes"),
                 ]),
@@ -1017,9 +1214,9 @@ final class App {
             if selEnd >= scroll + bodyHeight { scroll = selEnd - bodyHeight + 1 }
             scroll = max(0, min(scroll, rows.count - bodyHeight))
 
-            let listW = min(18, max(6, items.map { $0.reminder.calendar?.title.count ?? 0 }.max() ?? 0))
+            let layout = rowLayout(inner: inner, now: now)
             for row in rows.dropFirst(scroll).prefix(bodyHeight) {
-                lines.append(sp(pad) + line(for: row, inner: inner, listW: listW, now: now))
+                lines.append(sp(pad) + line(for: row, inner: inner, layout: layout, now: now))
             }
         }
         while lines.count < H - footerH { lines.append("") }
@@ -1043,8 +1240,8 @@ final class App {
         case .input:
             guard var ed = editor else { break }
             let kind = ed.kind
-            let titleLabel = kind == .add ? "New   › " : "Edit  › "
-            let notesLabel = "Notes › "
+            let titleLabel = kind == .add ? "New    › " : "Edit   › "
+            let notesLabel = "Notes  › "
             let fieldW = max(1, inner - titleLabel.count - 1)
 
             /// Draw one field; keeps the cursor inside the visible window.
@@ -1087,6 +1284,16 @@ final class App {
             lines.append(draw(&ed.title, label: titleLabel, focused: ed.focus == .title, placeholder: ""))
             lines += drawNotes(&ed.notes, label: notesLabel, focused: ed.focus == .notes,
                                placeholder: "add notes (tab)")
+            // Repeat line: a selector, not a text field (no cursor).
+            let repFocused = ed.focus == .repeats
+            let choice = ed.repeatChoice
+            let repLabel = repFocused ? paint("Repeat › ", Gruv.orange, Style.bold) : paint("Repeat › ", Gruv.gray)
+            let repValue = choice.repeats ? "↻ " + choice.label : choice.label
+            let repColor = choice.repeats ? Gruv.aqua : (repFocused ? Gruv.fg : Gruv.fg4)
+            lines.append(sp(pad) + repLabel
+                         + (repFocused ? paint("‹ ", Gruv.gray) : "")
+                         + paint(repValue, repColor, repFocused ? Style.bold : "")
+                         + (repFocused ? paint(" ›", Gruv.gray) : ""))
             editor = ed
 
             let p = parseEntry(ed.title.string)
@@ -1102,8 +1309,13 @@ final class App {
             if kind == .add, let list = store.defaultCalendarForNewReminders() {
                 preview += paint("  in ", Gruv.gray) + paint(list.title, color(for: list))
             }
-            preview += paint(ed.focus == .notes ? "   ⌥↵ newline · enter save · esc cancel"
-                                                : "   tab notes · enter save · esc cancel", Gruv.bg3)
+            let hint: String
+            switch ed.focus {
+            case .title: hint = "tab notes"
+            case .notes: hint = "⌥↵ newline · tab repeat"
+            case .repeats: hint = "space change"
+            }
+            preview += paint("   \(hint) · enter save · esc cancel", Gruv.bg3)
             lines.append(sp(pad) + preview)
         }
 
@@ -1127,7 +1339,50 @@ final class App {
         return out
     }
 
-    func line(for row: Row, inner: Int, listW: Int, now: Date) -> String {
+    /// Column widths for item rows. 0 = column hidden.
+    struct RowLayout {
+        var titleW = 8, dateW = 0, repW = 0, listW = 0
+        var shortRepeat = false   // "wkdays" instead of "weekdays"
+    }
+
+    /// Fit columns into `inner`, sized to what's actually on screen. The
+    /// title keeps at least `minTitle`; the repeat column wins over the list
+    /// column, and falls back to short labels, then to a "↻" after the date.
+    func rowLayout(inner: Int, now: Date) -> RowLayout {
+        let minTitle = 12, gap = 2
+        var l = RowLayout()
+        l.dateW = items.map { dueText($0, now: now).count }.max() ?? 0
+        let dateCol = l.dateW > 0 ? l.dateW + gap : 0
+        var room = inner - 4 - dateCol - minTitle   // 4 = marker + check
+        let full = items.compactMap { Recur.describe($0.reminder)?.count }.max().map { min(16, $0 + 2) } ?? 0
+        let short = items.compactMap { Recur.short($0.reminder)?.count }.max().map { $0 + 2 } ?? 0
+        if full > 0 {
+            if room >= full + gap + 4 { l.repW = full }   // +4: rather shorten labels than titles
+            else if room >= short + gap { l.repW = short; l.shortRepeat = true }
+            if l.repW == 0 {   // " ↻" after the date instead
+                room -= l.dateW > 0 ? 2 : gap + 1
+                l.dateW += l.dateW > 0 ? 2 : 1
+            } else {
+                room -= l.repW + gap
+            }
+        }
+        let listW = min(18, max(6, items.map { $0.reminder.calendar?.title.count ?? 0 }.max() ?? 0))
+        if room >= listW + gap + 6 { l.listW = listW }   // +6: keep the title roomier than the list
+        l.titleW = max(8, inner - 4 - (l.dateW > 0 ? l.dateW + gap : 0) - (l.repW > 0 ? l.repW + gap : 0) - (l.listW > 0 ? l.listW + gap : 0))
+        return l
+    }
+
+    /// "17:04" for today/tomorrow rows, "Nov 13, 07:00" further out.
+    func dueText(_ it: Item, now: Date) -> String {
+        switch section(for: it.due, now: now, history: it.history).style {
+        case .timeOnly: return it.allDay ? "" : Fmt.time.string(from: it.due)
+        case .full:
+            let d = Fmt.monthDay.string(from: it.due)
+            return it.allDay ? d : d + ", " + Fmt.time.string(from: it.due)
+        }
+    }
+
+    func line(for row: Row, inner: Int, layout l: RowLayout, now: Date) -> String {
         switch row {
         case .blank:
             return ""
@@ -1140,9 +1395,7 @@ final class App {
             let r = it.reminder
             let selected = i == sel
             let done = r.isCompleted
-            let showList = inner >= 60
-            let dateW = 18
-            let titleW = max(8, inner - 4 - dateW - (showList ? listW + 2 : 0))
+            let titleW = l.titleW, dateW = l.dateW
 
             let marker = selected ? paint("▌", Gruv.orange) + " " : "  "
             let check = done ? paint("●", Gruv.green) + " " : paint("○", selected ? Gruv.fg : Gruv.gray) + " "
@@ -1156,24 +1409,25 @@ final class App {
             else if selected { titleStyled = paint(titleText, Gruv.fg, Style.bold) }
             else { titleStyled = paint(titleText, Gruv.fg2) }
 
-            var dateText: String
-            switch section(for: it.due, now: now, history: it.history).style {
-            case .timeOnly: dateText = it.allDay ? "" : Fmt.time.string(from: it.due)
-            case .full:
-                dateText = Fmt.monthDay.string(from: it.due)
-                if !it.allDay { dateText += ", " + Fmt.time.string(from: it.due) }
-            }
-            if r.hasRecurrenceRules { dateText += " ↻" }
+            var dateText = dueText(it, now: now)
+            if r.hasRecurrenceRules && l.repW == 0 { dateText += " ↻" }   // too narrow for the repeat column
             dateText = dateText.clip(dateW)
             let dateColor = it.isOverdue(now: now) ? Gruv.red : (selected ? Gruv.fg2 : Gruv.fg4)
-            let dateStyled = sp(dateW - dateText.count) + paint(dateText, done ? Gruv.gray : dateColor)
+            let dateStyled = sp((dateW > 0 ? 2 : 0) + dateW - dateText.count) + paint(dateText, done ? Gruv.gray : dateColor)
+
+            var repStyled = ""
+            if l.repW > 0 {
+                let label = l.shortRepeat ? Recur.short(r) : Recur.describe(r)
+                let text = label.map { ("↻ " + $0).fit(l.repW) } ?? sp(l.repW)
+                repStyled = sp(2) + paint(text, done ? Gruv.gray : Gruv.aqua)
+            }
 
             var listStyled = ""
-            if showList {
-                let name = (r.calendar?.title ?? "").fit(listW)
+            if l.listW > 0 {
+                let name = (r.calendar?.title ?? "").fit(l.listW)
                 listStyled = sp(2) + paint(name, done ? Gruv.gray : color(for: r.calendar))
             }
-            return marker + check + prioPart + titleStyled + dateStyled + listStyled
+            return marker + check + prioPart + titleStyled + dateStyled + repStyled + listStyled
         }
     }
 }
@@ -1190,7 +1444,8 @@ func dump(_ store: EKEventStore) {
             if s.key != last { print("\n\(s.title)\(s.subtitle.isEmpty ? "" : "  \(s.subtitle)")"); last = s.key }
             let when = it.allDay ? Fmt.monthDay.string(from: it.due)
                                  : Fmt.monthDay.string(from: it.due) + ", " + Fmt.time.string(from: it.due)
-            print("  ○ \(it.reminder.title ?? "")  —  \(when)  [\(it.reminder.calendar?.title ?? "")]")
+            let rep = Recur.describe(it.reminder).map { "  ↻ \($0)" } ?? ""
+            print("  ○ \(it.reminder.title ?? "")  —  \(when)\(rep)  [\(it.reminder.calendar?.title ?? "")]")
         }
         print("\n\(items.count) scheduled")
         exit(0)
