@@ -1149,9 +1149,11 @@ final class App {
         // ── header
         let open = items.filter { !$0.reminder.isCompleted }.count
         let overdue = items.filter { $0.isOverdue(now: now) }.count
-        let countText = "\(open) scheduled"
+        var countText = "\(open) scheduled"
         let overText = overdue > 0 ? " · \(overdue) overdue" : ""
         let title = "Scheduled"
+        // Narrow: "2 · 1 overdue" instead of running into the title.
+        if title.count + 1 + countText.count + overText.count > inner { countText = "\(open)" }
         lines.append("")
         lines.append(sp(pad) + paint(title, Gruv.red, Style.bold)
                      + sp(inner - title.count - countText.count - overText.count)
@@ -1159,11 +1161,25 @@ final class App {
         lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
 
         // ── body
-        var footerH = 3   // separator + 2 lines (title, notes lines + repeat + hint when editing)
+        // Bottom hint lines wrap on narrow terminals, so build them first to
+        // know how much room the footer needs.
+        var tail: [String] = []
+        switch mode {
+        case .normal:
+            tail = flow([("⌘N", "new"), ("⇧⌘C", "done"), ("⌘T", "today"), ("⌥⌘T", "tomorrow"),
+                         ("⌘K", "weekend"), ("⇧⌘H", "completed"), ("⌫", "delete"), ("?", "help")]
+                        .map { k, label in Hint(sep: "   ", pieces: [(k, Gruv.yellow), (" " + label, Gruv.gray)]) },
+                        width: inner)
+        case .input: if let ed = editor { tail = editorTail(ed, width: inner) }
+        case .confirmDelete: break
+        }
+        // separator + status (only while a message shows) + hints; or the delete prompt
+        var footerH = 1 + tail.count + (status != nil ? 1 : 0)
+        if case .confirmDelete = mode { footerH = 3 }   // separator + prompt + blank
         noteFieldWidth = max(1, inner - 9 - 1)   // 9 = label width ("Notes  › ")
         if case .input = mode, let ed = editor {
             let n = wrapRanges(ed.notes.text, width: noteFieldWidth).count
-            footerH = 4 + min(App.maxNoteFieldRows, max(1, n))
+            footerH = 3 + min(App.maxNoteFieldRows, max(1, n)) + tail.count   // separator + title + notes + repeat + tail
         }
         bodyHeight = max(1, H - lines.count - footerH)
         notesWidth = max(1, inner - 6)
@@ -1227,11 +1243,8 @@ final class App {
         var cursor: (row: Int, col: Int)?
         switch mode {
         case .normal:
-            if let (msg, c) = status { lines.append(sp(pad) + paint(msg.clip(inner), c)) } else { lines.append("") }
-            lines.append(sp(pad) + hints([("⌘N", "new"), ("⇧⌘C", "done"), ("⌘T", "today"), ("⌥⌘T", "tomorrow"),
-                                          ("⌘K", "weekend"), ("⇧⌘H", "completed"), ("⌫", "delete"),
-                                          ("?", "help")],
-                                         width: inner))
+            if let (msg, c) = status { lines.append(sp(pad) + paint(msg.clip(inner), c)) }
+            lines += tail.map { sp(pad) + $0 }
         case .confirmDelete(let r):
             let name = r.title ?? ""
             lines.append(sp(pad) + paint("Delete “\(name.clip(inner - 20))”? ", Gruv.red, Style.bold)
@@ -1296,27 +1309,7 @@ final class App {
                          + (repFocused ? paint(" ›", Gruv.gray) : ""))
             editor = ed
 
-            let p = parseEntry(ed.title.string)
-            var preview: String
-            if let d = p.date {
-                preview = paint("due ", Gruv.gray) + paint(describeDue(d, allDay: p.allDay), Gruv.aqua)
-            } else if kind == .add {
-                preview = paint("due ", Gruv.gray) + paint("Today", Gruv.aqua)
-                    + paint("  · try “dentist friday 3pm”", Gruv.gray)
-            } else {
-                preview = paint("due date unchanged", Gruv.gray)
-            }
-            if kind == .add, let list = store.defaultCalendarForNewReminders() {
-                preview += paint("  in ", Gruv.gray) + paint(list.title, color(for: list))
-            }
-            let hint: String
-            switch ed.focus {
-            case .title: hint = "tab notes"
-            case .notes: hint = "⌥↵ newline · tab repeat"
-            case .repeats: hint = "space change"
-            }
-            preview += paint("   \(hint) · enter save · esc cancel", Gruv.bg3)
-            lines.append(sp(pad) + preview)
+            lines += tail.map { sp(pad) + $0 }
         }
 
         var frame = "\u{1B}[H"
@@ -1327,16 +1320,59 @@ final class App {
         Terminal.out(frame)
     }
 
-    func hints(_ pairs: [(String, String)], width: Int) -> String {
-        var out = "", used = 0
-        for (k, label) in pairs {
-            let w = k.count + 1 + label.count + (used > 0 ? 3 : 0)
-            if used + w > width { break }
-            if used > 0 { out += "   " }
-            out += paint(k, Gruv.yellow) + " " + paint(label, Gruv.gray)
-            used += w
+    /// One unbreakable chunk of a hint line; `sep` goes before it unless it starts a line.
+    struct Hint {
+        var sep: String
+        var pieces: [(String, RGB)]
+        var optional = false   // dropped rather than wrapped onto its own line
+        var width: Int { pieces.reduce(0) { $0 + $1.0.count } }
+    }
+
+    /// Lay hints out left to right, wrapping whole chunks onto new lines.
+    func flow(_ hints: [Hint], width: Int) -> [String] {
+        var out: [String] = [], cur = "", used = 0
+        for h in hints {
+            if used > 0 && used + h.sep.count + h.width > width {
+                if h.optional { continue }
+                out.append(cur); cur = ""; used = 0
+            }
+            if used > 0 { cur += h.sep; used += h.sep.count }
+            var left = width - used   // a chunk wider than a whole line gets clipped
+            for (text, color) in h.pieces where left > 0 {
+                let t = text.count > left ? text.clip(left) : text
+                cur += paint(t, color); used += t.count; left -= t.count
+            }
         }
+        if used > 0 { out.append(cur) }
         return out
+    }
+
+    /// The editor's due-date preview plus key hints, wrapped to `width`.
+    func editorTail(_ ed: Editor, width: Int) -> [String] {
+        let p = parseEntry(ed.title.string)
+        var hs: [Hint] = []
+        if let d = p.date {
+            hs.append(Hint(sep: "", pieces: [("due ", Gruv.gray), (describeDue(d, allDay: p.allDay), Gruv.aqua)]))
+        } else if ed.kind == .add {
+            hs.append(Hint(sep: "", pieces: [("due ", Gruv.gray), ("Today", Gruv.aqua)]))
+            hs.append(Hint(sep: "  ", pieces: [("· try “dentist friday 3pm”", Gruv.gray)], optional: true))
+        } else {
+            hs.append(Hint(sep: "", pieces: [("due date unchanged", Gruv.gray)]))
+        }
+        if ed.kind == .add, let list = store.defaultCalendarForNewReminders() {
+            hs.append(Hint(sep: "  ", pieces: [("in ", Gruv.gray), (list.title, color(for: list))]))
+        }
+        var keys: [String]
+        switch ed.focus {
+        case .title: keys = ["tab notes"]
+        case .notes: keys = ["⌥↵ newline", "tab repeat"]
+        case .repeats: keys = ["space change"]
+        }
+        keys += ["enter save", "esc cancel"]
+        for (i, k) in keys.enumerated() {
+            hs.append(Hint(sep: i == 0 ? "   " : " · ", pieces: [(k, Gruv.bg3)]))
+        }
+        return flow(hs, width: width)
     }
 
     /// Column widths for item rows. 0 = column hidden.
