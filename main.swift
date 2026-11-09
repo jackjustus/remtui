@@ -59,6 +59,36 @@ extension String {
     var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
 
+/// Split text into visual lines no wider than `w`: hard breaks at "\n",
+/// soft breaks at the last space that fits (or mid-word if none). Ranges
+/// exclude the "\n" itself; soft-wrapped ranges are contiguous.
+func wrapRanges(_ text: [Character], width w: Int) -> [Range<Int>] {
+    let w = max(1, w)
+    var out: [Range<Int>] = []
+    var start = 0
+    while true {
+        var end = start
+        while end < text.count, text[end] != "\n" { end += 1 }
+        // wrap the hard line start..<end
+        var s = start
+        while end - s > w {
+            var cut = s + w
+            if let sp = (s + 1..<s + w).last(where: { text[$0] == " " }) { cut = sp + 1 }
+            out.append(s..<cut)
+            s = cut
+        }
+        out.append(s..<end)
+        if end >= text.count { break }
+        start = end + 1
+    }
+    return out
+}
+
+/// Index of the visual line holding `cursor` (a soft-wrap boundary belongs to the next line).
+func lineIndex(of cursor: Int, in lines: [Range<Int>]) -> Int {
+    lines.lastIndex { $0.lowerBound <= cursor } ?? 0
+}
+
 /// Map an arbitrary list color onto the nearest Gruvbox accent by hue.
 func gruvColor(for cg: CGColor?) -> RGB {
     guard let cg,
@@ -495,6 +525,21 @@ struct Field {
         return i
     }
 
+    /// Move the cursor up/down one visual (wrapped) line, keeping its column.
+    /// Returns false when already on the first/last line.
+    mutating func moveLine(_ d: Int, width: Int) -> Bool {
+        let vis = wrapRanges(text, width: width)
+        let cl = lineIndex(of: cursor, in: vis)
+        let target = cl + d
+        guard vis.indices.contains(target) else { return false }
+        let col = cursor - vis[cl].lowerBound
+        let t = vis[target]
+        // on a soft-wrapped line, the end index belongs to the next line, so stop one short
+        let softEnd = target + 1 < vis.count && vis[target + 1].lowerBound == t.upperBound
+        cursor = t.lowerBound + min(col, max(0, t.count - (softEnd ? 1 : 0)))
+        return true
+    }
+
     mutating func insert(_ c: Character) { text.insert(c, at: cursor); cursor += 1 }
     mutating func move(to i: Int) { cursor = max(0, min(text.count, i)) }
     mutating func deleteRange(_ a: Int, _ b: Int) {
@@ -565,6 +610,10 @@ final class App {
     var statusClear: DispatchWorkItem?
     var listColors: [String: RGB] = [:]
     var bodyHeight = 10
+    var notesWidth = 60      // wrap width for notes under the selected item (set by render)
+    var noteFieldWidth = 60  // wrap width of the notes field in the editor (set by render)
+    static let maxNoteRows = 8      // notes lines shown under the selected item
+    static let maxNoteFieldRows = 5 // notes lines shown in the editor
     var showCompleted = false
     var showHelp = false
 
@@ -792,8 +841,11 @@ final class App {
                 submit(ed)
                 return
             case .tab: ed.focus = ed.focus == .title ? .notes : .title
-            case .down: ed.focus = .notes
-            case .up: ed.focus = .title
+            case .down where ed.focus == .title: ed.focus = .notes
+            case .up where ed.focus == .notes:
+                if !ed.notes.moveLine(-1, width: noteFieldWidth) { ed.focus = .title }
+            case .down: _ = ed.notes.moveLine(1, width: noteFieldWidth)
+            case .up: break
             default:
                 switch ed.focus {
                 case .title: _ = ed.title.handle(key, multiline: false)
@@ -878,8 +930,14 @@ final class App {
             }
             rows.append(.item(i))
             if i == sel, let n = it.reminder.notes?.trimmed, !n.isEmpty {
-                let first = n.split(whereSeparator: \.isNewline).first.map(String.init) ?? n
-                rows.append(.notes(first))
+                let chars = Array(n.replacingOccurrences(of: "\r\n", with: "\n")
+                                   .replacingOccurrences(of: "\r", with: "\n"))
+                var wrapped = wrapRanges(chars, width: notesWidth).map { String(chars[$0]) }
+                if wrapped.count > App.maxNoteRows {
+                    wrapped = Array(wrapped.prefix(App.maxNoteRows))
+                    wrapped[wrapped.count - 1] = String(wrapped[wrapped.count - 1].prefix(notesWidth - 1)) + "…"
+                }
+                rows += wrapped.map { .notes($0) }
             }
         }
         return rows
@@ -905,9 +963,14 @@ final class App {
         lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
 
         // ── body
-        var footerH = 3   // separator + 2 lines (3 lines of fields + hint when editing)
-        if case .input = mode { footerH = 4 }
+        var footerH = 3   // separator + 2 lines (title, notes lines + hint when editing)
+        noteFieldWidth = max(1, inner - 8 - 1)   // 8 = label width ("Notes › ")
+        if case .input = mode, let ed = editor {
+            let n = wrapRanges(ed.notes.text, width: noteFieldWidth).count
+            footerH = 3 + min(App.maxNoteFieldRows, max(1, n))
+        }
         bodyHeight = max(1, H - lines.count - footerH)
+        notesWidth = max(1, inner - 6)
         let rows = buildRows()
         if showHelp {
             let groups: [(String, [(String, String)])] = [
@@ -946,7 +1009,7 @@ final class App {
         } else {
             let selRow = rows.firstIndex { if case .item(let i) = $0 { return i == sel }; return false } ?? 0
             var selEnd = selRow
-            if selRow + 1 < rows.count, case .notes = rows[selRow + 1] { selEnd += 1 }
+            while selEnd + 1 < rows.count, case .notes = rows[selEnd + 1] { selEnd += 1 }
             var top = selRow
             if selRow > 0, case .header = rows[selRow - 1] { top -= 1 }
             if sel == 0 { top = 0 }
@@ -996,9 +1059,34 @@ final class App {
                 if focused { cursor = (lines.count + 1, pad + label.count + (f.cursor - f.scroll) + 1) }
                 return sp(pad) + labelStyled + body
             }
+            /// Draw the notes field soft-wrapped over several rows; `scroll` is the first visible line.
+            func drawNotes(_ f: inout Field, label: String, focused: Bool, placeholder: String) -> [String] {
+                let labelStyled = focused ? paint(label, Gruv.orange, Style.bold) : paint(label, Gruv.gray)
+                if f.text.isEmpty && !focused {
+                    return [sp(pad) + labelStyled + paint(placeholder, Gruv.bg3, Style.italic)]
+                }
+                let vis = wrapRanges(f.text, width: fieldW)
+                let rowsShown = min(App.maxNoteFieldRows, vis.count)
+                let cl = lineIndex(of: f.cursor, in: vis)
+                if cl < f.scroll { f.scroll = cl }
+                if cl >= f.scroll + rowsShown { f.scroll = cl - rowsShown + 1 }
+                f.scroll = max(0, min(f.scroll, vis.count - rowsShown))
+                if focused {
+                    cursor = (lines.count + 1 + (cl - f.scroll),
+                              pad + label.count + (f.cursor - vis[cl].lowerBound) + 1)
+                }
+                var out: [String] = []
+                for li in f.scroll..<(f.scroll + rowsShown) {
+                    let head = li == f.scroll ? labelStyled : sp(label.count)
+                    let more = li == f.scroll + rowsShown - 1 && li < vis.count - 1
+                    out.append(sp(pad) + head + paint(String(f.text[vis[li]]), focused ? Gruv.fg : Gruv.fg4)
+                               + (more ? paint(" …", Gruv.bg3) : ""))
+                }
+                return out
+            }
             lines.append(draw(&ed.title, label: titleLabel, focused: ed.focus == .title, placeholder: ""))
-            lines.append(draw(&ed.notes, label: notesLabel, focused: ed.focus == .notes,
-                              placeholder: "add notes (tab)"))
+            lines += drawNotes(&ed.notes, label: notesLabel, focused: ed.focus == .notes,
+                               placeholder: "add notes (tab)")
             editor = ed
 
             let p = parseEntry(ed.title.string)
