@@ -27,6 +27,68 @@ enum Gruv {
     static let purple = RGB(0xd3869b)
     static let aqua = RGB(0x8ec07c)
     static let orange = RGB(0xfe8019)
+    static let fg0 = RGB(0xfbf1c7)   // pen tip of the strike sweep, shimmer band
+    static let bg0 = RGB(0x282828)   // what completed rows fade toward
+    static let glow = RGB(0xc8f5cd)  // hot aqua for synced arrivals
+}
+
+extension RGB: Equatable {
+    init(_ r: Int, _ g: Int, _ b: Int) { self.r = r; self.g = g; self.b = b }
+
+    /// Linear blend toward `o`; t is clamped to 0…1.
+    func mix(_ o: RGB, _ t: Double) -> RGB {
+        let t = clamp01(t)
+        func lerp(_ x: Int, _ y: Int) -> Int { x + Int((Double(y - x) * t).rounded()) }
+        return RGB(lerp(r, o.r), lerp(g, o.g), lerp(b, o.b))
+    }
+}
+
+// MARK: - Motion
+
+func clamp01(_ t: Double) -> Double { min(max(t, 0), 1) }
+
+/// Monotonic seconds; animation progress is computed from this, never from
+/// frame counts, so the frame rate is only a cap.
+func uptime() -> Double { ProcessInfo.processInfo.systemUptime }
+
+enum Ease {
+    /// Cubic ease-out: fast start, gentle landing.
+    static func out(_ t: Double) -> Double { let u = 1 - clamp01(t); return 1 - u * u * u }
+}
+
+/// One terminal cell, for rows whose characters animate individually.
+struct Cell {
+    var ch: Character
+    var color: RGB
+    var bold = false
+    var italic = false
+    var strike = false
+}
+
+func cells(_ s: String, _ c: RGB, bold: Bool = false, italic: Bool = false) -> [Cell] {
+    s.map { Cell(ch: $0, color: c, bold: bold, italic: italic) }
+}
+
+/// Paint cells, merging runs that share a style into one escape sequence.
+func paintCells(_ cs: [Cell]) -> String {
+    var out = "", run = ""
+    var cur: Cell?
+    func flush() {
+        guard let c = cur, !run.isEmpty else { return }
+        out += paint(run, c.color, (c.bold ? Style.bold : "") + (c.italic ? Style.italic : "") + (c.strike ? Style.strike : ""))
+        run = ""
+    }
+    for c in cs {
+        if let p = cur, p.color == c.color, p.bold == c.bold, p.italic == c.italic, p.strike == c.strike {
+            run.append(c.ch)
+        } else {
+            flush()
+            cur = c
+            run = String(c.ch)
+        }
+    }
+    flush()
+    return out
 }
 
 enum Style {
@@ -716,7 +778,7 @@ final class App {
     enum InputKind { case add, edit }
     enum Mode { case normal, input, confirmDelete(EKReminder) }
     enum Row {
-        case header(Section), item(Int), notes(String), blank
+        case header(Section), item(Int), notes(String, Int), blank   // notes: text, line index
     }
 
     struct Editor {
@@ -769,30 +831,105 @@ final class App {
     var showCompleted = false
     var showHelp = false
 
+    // MARK: animation state
+
+    static let fps = 120.0            // cap; progress is time-based
+    static let strikeDur = 0.22       // strike sweep across a completed title
+    static let fadeDur = 0.38         // completed rows fade out before hiding
+    static let noteDwell = 0.10       // notes wait until the selection rests
+    static let noteStagger = 0.06     // each note line drops in this long after the last
+    static let noteSettle = 0.24      // a note line cools from title color to gray
+    static let syncDur = 1.4          // arrival from another device
+    static let lowerEighths = ["", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    // Upper 2/8, 3/8, 5/8, 6/8, 7/8 are from Symbols for Legacy Computing;
+    // Ghostty draws block elements itself, so no font support is needed.
+    static let upperEighths = ["", "▔", "\u{1FB82}", "\u{1FB83}", "▀", "\u{1FB84}", "\u{1FB85}", "\u{1FB86}", "█"]
+
+    enum AnimKind { case strike, fadeOut, notes, sync }
+    struct AnimKey: Hashable { let id: String; let kind: AnimKind }
+    struct Anim {
+        let start: Double
+        let dur: Double
+        var hold = false   // keep the end state after finishing (removed explicitly)
+    }
+    struct Glide { let from: Double; let to: Double; let start: Double; let dur: Double }
+
+    var anims: [AnimKey: Anim] = [:]
+    var frameTimer: DispatchSourceTimer?
+    var barY: Double?      // selection bar, in body rows (fractional while gliding)
+    var barTarget: Int?
+    var glide: Glide?
+    var lastSelID: String?
+    var knownIDs: Set<String> = []   // reminders on screen after the last reload
+    var localIDs: Set<String> = []   // created here, so their arrival isn't a "sync"
+    var lastFrame: [String] = []     // for redrawing only the lines that changed
+    var lastSize = (rows: 0, cols: 0)
+
     init(store: EKEventStore) { self.store = store }
+
+    func animate(_ id: String, _ kind: AnimKind, _ dur: Double, delay: Double = 0, hold: Bool = false) {
+        anims[AnimKey(id: id, kind: kind)] = Anim(start: uptime() + delay, dur: dur, hold: hold)
+        startClock()
+    }
+
+    /// 0…1 while `kind` is running (or held) on `id`; nil otherwise.
+    func progress(_ id: String, _ kind: AnimKind, at t: Double) -> Double? {
+        anims[AnimKey(id: id, kind: kind)].map { clamp01((t - $0.start) / $0.dur) }
+    }
+
+    /// Seconds since the notes animation for `id` started (negative during the dwell).
+    func notesElapsed(_ id: String) -> Double? {
+        anims[AnimKey(id: id, kind: .notes)].map { uptime() - $0.start }
+    }
+
+    func isAnimating(at t: Double) -> Bool {
+        glide != nil || anims.values.contains { t < $0.start + $0.dur }
+    }
+
+    /// Runs only while something moves, so an idle remtui draws nothing.
+    func startClock() {
+        guard frameTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 1.0 / App.fps, leeway: .microseconds(500))
+        timer.setEventHandler { [weak self] in self?.tickFrame() }
+        frameTimer = timer
+        timer.resume()
+    }
+
+    func tickFrame() {
+        let t = uptime()
+        anims = anims.filter { $0.value.hold || t < $0.value.start + $0.value.dur }
+        render()
+        if !isAnimating(at: t) {
+            frameTimer?.cancel()
+            frameTimer = nil
+        }
+    }
 
     var current: Item? { items.indices.contains(sel) ? items[sel] : nil }
 
     // MARK: data
 
-    func reload() {
+    /// `syncing`: the store changed underneath us (iCloud, another device),
+    /// so reminders we haven't seen before get the arrival animation.
+    func reload(syncing: Bool = false) {
         let store = self.store
         let withCompleted = showCompleted
         let pred = store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: nil)
         store.fetchReminders(matching: pred) { [weak self] rs in
             let open = rs ?? []
             guard withCompleted else {
-                DispatchQueue.main.async { self?.apply(open, []) }
+                DispatchQueue.main.async { self?.apply(open, [], syncing: syncing) }
                 return
             }
             let cpred = store.predicateForCompletedReminders(withCompletionDateStarting: nil, ending: nil, calendars: nil)
             store.fetchReminders(matching: cpred) { cs in
-                DispatchQueue.main.async { self?.apply(open, cs ?? []) }
+                DispatchQueue.main.async { self?.apply(open, cs ?? [], syncing: syncing) }
             }
         }
     }
 
-    func apply(_ open: [EKReminder], _ completed: [EKReminder]) {
+    func apply(_ open: [EKReminder], _ completed: [EKReminder], syncing: Bool = false) {
         let keepID = pendingSelect ?? current?.id
         pendingSelect = nil
         var all = open
@@ -812,6 +949,12 @@ final class App {
                 && Calendar.current.startOfDay(for: it.due) < today
             return it
         })
+        if syncing && loaded {
+            for it in items where !knownIDs.contains(it.id) && !localIDs.contains(it.id) && !it.reminder.isCompleted {
+                animate(it.id, .sync, App.syncDur)
+            }
+        }
+        knownIDs = Set(items.map(\.id))
         loaded = true
         if let keepID, let i = items.firstIndex(where: { $0.id == keepID }) { sel = i }
         sel = max(0, min(sel, items.count - 1))
@@ -858,10 +1001,15 @@ final class App {
             flash("Completed “\(r.title ?? "")”\(next)")
         } else if r.isCompleted {
             sessionDone.insert(it.id)
+            // A new completion restarts the linger, so un-fade any rows mid-fade.
+            anims = anims.filter { $0.key.kind != .fadeOut }
+            animate(it.id, .strike, App.strikeDur)
             scheduleDoneClear()
             flash("Completed “\(r.title ?? "")”")
         } else {
             sessionDone.remove(it.id)
+            anims[AnimKey(id: it.id, kind: .strike)] = nil
+            anims[AnimKey(id: it.id, kind: .fadeOut)] = nil
             flash("Marked “\(r.title ?? "")” incomplete", Gruv.yellow)
         }
         reload()
@@ -874,11 +1022,26 @@ final class App {
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.sessionDone.isEmpty else { return }
             guard case .normal = self.mode else { self.scheduleDoneClear(after: 1); return }
-            self.sessionDone.removeAll()
-            self.reload()
+            // Fade the rows out, then hide them.
+            for id in self.sessionDone { self.animate(id, .fadeOut, App.fadeDur, hold: true) }
+            let finish = DispatchWorkItem { [weak self] in self?.finishDoneClear() }
+            self.doneClear = finish
+            DispatchQueue.main.asyncAfter(deadline: .now() + App.fadeDur, execute: finish)
         }
         doneClear = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    func finishDoneClear() {
+        guard case .normal = mode else {
+            let retry = DispatchWorkItem { [weak self] in self?.finishDoneClear() }
+            doneClear = retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: retry)
+            return
+        }
+        sessionDone.removeAll()
+        anims = anims.filter { $0.key.kind != .fadeOut }
+        reload()
     }
 
     func shift(days: Int) {
@@ -981,6 +1144,7 @@ final class App {
             setDue(r, date, allDay: allDay)
             choice.apply(to: r)
             guard save(r) else { return }
+            localIDs.insert(r.calendarItemIdentifier)
             pendingSelect = r.calendarItemIdentifier
             let due = Item(r).map { describeDue($0.due, allDay: $0.allDay) } ?? ""   // may have moved (Weekdays/Weekends)
             flash("Added “\(p.title)” · \(due)\(repeatNote)")
@@ -1125,18 +1289,43 @@ final class App {
                 last = s.key
             }
             rows.append(.item(i))
-            if i == sel, let n = it.reminder.notes?.trimmed, !n.isEmpty {
-                let chars = Array(n.replacingOccurrences(of: "\r\n", with: "\n")
-                                   .replacingOccurrences(of: "\r", with: "\n"))
-                var wrapped = wrapRanges(chars, width: notesWidth).map { String(chars[$0]) }
-                if wrapped.count > App.maxNoteRows {
-                    wrapped = Array(wrapped.prefix(App.maxNoteRows))
-                    wrapped[wrapped.count - 1] = String(wrapped[wrapped.count - 1].prefix(notesWidth - 1)) + "…"
+            if i == sel {
+                // Drop from title: lines appear one after another (pushing
+                // the rows below down), after a short dwell on the item.
+                let wrapped = noteLines(it)
+                var shown = wrapped.count
+                if let el = notesElapsed(it.id) {
+                    shown = el < 0 ? 0 : min(shown, Int(el / App.noteStagger) + 1)
                 }
-                rows += wrapped.map { .notes($0) }
+                rows += wrapped.prefix(shown).enumerated().map { .notes($0.element, $0.offset) }
             }
         }
         return rows
+    }
+
+    /// The selected item's notes, wrapped to `notesWidth` and capped at `maxNoteRows`.
+    func noteLines(_ it: Item) -> [String] {
+        guard let n = it.reminder.notes?.trimmed, !n.isEmpty else { return [] }
+        let chars = Array(n.replacingOccurrences(of: "\r\n", with: "\n")
+                           .replacingOccurrences(of: "\r", with: "\n"))
+        var wrapped = wrapRanges(chars, width: notesWidth).map { String(chars[$0]) }
+        if wrapped.count > App.maxNoteRows {
+            wrapped = Array(wrapped.prefix(App.maxNoteRows))
+            wrapped[wrapped.count - 1] = String(wrapped[wrapped.count - 1].prefix(notesWidth - 1)) + "…"
+        }
+        return wrapped
+    }
+
+    /// The selection bar: an orange cell-tall block at fractional row `barY`,
+    /// drawn with eighth blocks across two cells while it glides.
+    func barCell(_ row: Int) -> String {
+        guard let y = barY else { return " " }
+        let q = (y * 8).rounded() / 8
+        let n = Int(q.rounded(.down))
+        let k = Int(((q - Double(n)) * 8).rounded())   // eighths below the top of row n
+        if row == n { return paint(App.lowerEighths[8 - k], Gruv.orange) }
+        if row == n + 1, k > 0 { return paint(App.upperEighths[k], Gruv.orange) }
+        return " "
     }
 
     func render() {
@@ -1147,18 +1336,34 @@ final class App {
         var lines: [String] = []
 
         // ── header
+        let t = uptime()
         let open = items.filter { !$0.reminder.isCompleted }.count
         let overdue = items.filter { $0.isOverdue(now: now) }.count
+        // Synced arrivals flash the count, show "+N", and glint the rule.
+        let syncs = anims.filter { $0.key.kind == .sync }.map { clamp01((t - $0.value.start) / $0.value.dur) }
+        let syncP = syncs.min()
+        let fresh = syncs.filter { $0 < 0.7 }.count
+        let plusText = fresh > 0 ? " +\(fresh)" : ""
         var countText = "\(open) scheduled"
         let overText = overdue > 0 ? " · \(overdue) overdue" : ""
         let title = "Scheduled"
         // Narrow: "2 · 1 overdue" instead of running into the title.
-        if title.count + 1 + countText.count + overText.count > inner { countText = "\(open)" }
+        if title.count + 1 + countText.count + plusText.count + overText.count > inner { countText = "\(open)" }
+        let countColor = syncP.map { Gruv.gray.mix(Gruv.glow, 1 - Ease.out($0)) } ?? Gruv.gray
+        let countBold = (syncP ?? 1) < 0.5 ? Style.bold : ""
         lines.append("")
         lines.append(sp(pad) + paint(title, Gruv.red, Style.bold)
-                     + sp(inner - title.count - countText.count - overText.count)
-                     + paint(countText, Gruv.gray) + paint(overText, Gruv.red))
-        lines.append(sp(pad) + paint(String(repeating: "─", count: inner), Gruv.bg3))
+                     + sp(inner - title.count - countText.count - plusText.count - overText.count)
+                     + paint(countText, countColor, countBold) + paint(plusText, Gruv.aqua, Style.bold)
+                     + paint(overText, Gruv.red))
+        var rule = cells(String(repeating: "─", count: inner), Gruv.bg3)
+        if let sy = syncP {
+            let xs = Ease.out(clamp01(sy / 0.5)) * Double(inner + 10) - 5
+            for k in rule.indices {
+                rule[k].color = rule[k].color.mix(Gruv.aqua, max(0, 1 - abs(Double(k) - xs) / 6))
+            }
+        }
+        lines.append(sp(pad) + paintCells(rule))
 
         // ── body
         // Bottom hint lines wrap on narrow terminals, so build them first to
@@ -1183,6 +1388,18 @@ final class App {
         }
         bodyHeight = max(1, H - lines.count - footerH)
         notesWidth = max(1, inner - 6)
+        // Selection changed: drop the new item's notes in once it's rested.
+        let selID = loaded ? current?.id : nil
+        if selID != lastSelID {
+            anims = anims.filter { $0.key.kind != .notes || $0.key.id == selID }
+            if lastSelID != nil, let it = current {
+                let n = noteLines(it).count
+                if n > 0 {
+                    animate(it.id, .notes, Double(n - 1) * App.noteStagger + App.noteSettle, delay: App.noteDwell)
+                }
+            }
+            lastSelID = selID
+        }
         let rows = buildRows()
         if showHelp {
             let groups: [(String, [(String, String)])] = [
@@ -1230,10 +1447,34 @@ final class App {
             if selEnd >= scroll + bodyHeight { scroll = selEnd - bodyHeight + 1 }
             scroll = max(0, min(scroll, rows.count - bodyHeight))
 
-            let layout = rowLayout(inner: inner, now: now)
-            for row in rows.dropFirst(scroll).prefix(bodyHeight) {
-                lines.append(sp(pad) + line(for: row, inner: inner, layout: layout, now: now))
+            // Glide the selection bar to the selected row's screen position.
+            let target = selRow - scroll
+            if barY == nil || barTarget == nil {
+                barY = Double(target)
+                glide = nil
+            } else if barTarget != target, let from = barY {
+                let d = abs(Double(target) - from)
+                glide = Glide(from: from, to: Double(target), start: t, dur: min(0.24, 0.09 + 0.016 * d))
+                startClock()
             }
+            barTarget = target
+            if let g = glide {
+                let p = clamp01((t - g.start) / g.dur)
+                barY = g.from + (g.to - g.from) * Ease.out(p)
+                if p >= 1 { glide = nil }
+            } else {
+                barY = Double(target)
+            }
+
+            let layout = rowLayout(inner: inner, now: now)
+            for (ri, row) in rows.dropFirst(scroll).prefix(bodyHeight).enumerated() {
+                lines.append(sp(pad - 1) + barCell(ri) + line(for: row, inner: inner, layout: layout, now: now))
+            }
+        }
+        if showHelp || !loaded || items.isEmpty {
+            barY = nil
+            barTarget = nil
+            glide = nil
         }
         while lines.count < H - footerH { lines.append("") }
         if lines.count > H - footerH { lines = Array(lines.prefix(max(0, H - footerH))) }
@@ -1312,11 +1553,24 @@ final class App {
             lines += tail.map { sp(pad) + $0 }
         }
 
-        var frame = "\u{1B}[H"
-        for (i, l) in lines.prefix(H).enumerated() {
-            frame += l + Style.reset + "\u{1B}[K" + (i < H - 1 ? "\r\n" : "")
+        // Only rewrite lines that changed, inside a synchronized update so
+        // the terminal never shows a half-drawn frame.
+        var frame = "\u{1B}[?2026h"
+        if lastSize.rows != H || lastSize.cols != W {
+            frame += "\u{1B}[2J"
+            lastFrame = []
+            lastSize = (H, W)
         }
+        let shown = lines.prefix(H).map { $0 + Style.reset + "\u{1B}[K" }
+        for (i, l) in shown.enumerated() where i >= lastFrame.count || lastFrame[i] != l {
+            frame += "\u{1B}[\(i + 1);1H" + l
+        }
+        if lastFrame.count > shown.count {
+            for i in shown.count..<lastFrame.count { frame += "\u{1B}[\(i + 1);1H\u{1B}[K" }
+        }
+        lastFrame = shown
         if let cursor { frame += "\u{1B}[\(cursor.row);\(cursor.col)H\u{1B}[?25h" } else { frame += "\u{1B}[?25l" }
+        frame += "\u{1B}[?2026l"
         Terminal.out(frame)
     }
 
@@ -1424,46 +1678,93 @@ final class App {
             return ""
         case .header(let s):
             return paint(s.title, s.color, Style.bold) + (s.subtitle.isEmpty ? "" : "  " + paint(s.subtitle, Gruv.gray))
-        case .notes(let n):
-            return sp(6) + paint(n.clip(inner - 6), Gruv.gray, Style.italic)
+        case .notes(let n, let k):
+            // Drop from title: each line starts in the title's color and
+            // cools to dim italic gray.
+            var color = Gruv.gray, italic = true
+            if let id = current?.id, let el = notesElapsed(id) {
+                let tk = clamp01((el - Double(k) * App.noteStagger) / App.noteSettle)
+                color = Gruv.fg.mix(Gruv.gray, Ease.out(tk))
+                italic = tk > 0.5
+            }
+            return sp(6) + paint(n.clip(inner - 6), color, italic ? Style.italic : "")
         case .item(let i):
             let it = items[i]
             let r = it.reminder
             let selected = i == sel
             let done = r.isCompleted
             let titleW = l.titleW, dateW = l.dateW
+            let t = uptime()
+            let syncP = progress(it.id, .sync, at: t)
+            let live = (syncP ?? 1) < 0.85   // arrival still settling: bold aqua
 
-            let marker = selected ? paint("▌", Gruv.orange) + " " : "  "
-            let check = done ? paint("●", Gruv.green) + " " : paint("○", selected ? Gruv.fg : Gruv.gray) + " "
+            var cs = cells("  ", Gruv.fg)   // the selection bar lives in the padding to the left
+            if done { cs += cells("● ", Gruv.green) }
+            else { cs += cells("○ ", live ? Gruv.aqua : (selected ? Gruv.fg : Gruv.gray), bold: live) }
 
             let prio = done ? "" : priorityMark(r.priority)
-            let prioPart = prio.isEmpty ? "" : paint(prio + " ", Gruv.red, Style.bold)
+            if !prio.isEmpty { cs += cells(prio + " ", Gruv.red, bold: true) }
             let prioW = prio.isEmpty ? 0 : prio.count + 1
             let titleText = (r.title ?? "").fit(titleW - prioW)
-            let titleStyled: String
-            if done { titleStyled = paint(titleText, Gruv.gray, Style.strike) }
-            else if selected { titleStyled = paint(titleText, Gruv.fg, Style.bold) }
-            else { titleStyled = paint(titleText, Gruv.fg2) }
+            if done {
+                // Strike sweep: the strike line eases across the title with a
+                // bright pen tip, while the title dims to gray.
+                let p = progress(it.id, .strike, at: t)
+                let e = p.map(Ease.out) ?? 1
+                let struck = Int((e * Double(titleText.count)).rounded())
+                let base = Gruv.fg2.mix(Gruv.gray, e)
+                for (j, ch) in titleText.enumerated() {
+                    let tip = (p ?? 1) < 1 && j == struck - 1
+                    cs.append(Cell(ch: ch, color: tip ? Gruv.fg0 : base, strike: j < struck))
+                }
+            } else if selected || live {
+                cs += cells(titleText, Gruv.fg, bold: true)
+            } else {
+                cs += cells(titleText, Gruv.fg2)
+            }
 
             var dateText = dueText(it, now: now)
             if r.hasRecurrenceRules && l.repW == 0 { dateText += " ↻" }   // too narrow for the repeat column
             dateText = dateText.clip(dateW)
             let dateColor = it.isOverdue(now: now) ? Gruv.red : (selected ? Gruv.fg2 : Gruv.fg4)
-            let dateStyled = sp((dateW > 0 ? 2 : 0) + dateW - dateText.count) + paint(dateText, done ? Gruv.gray : dateColor)
+            cs += cells(sp((dateW > 0 ? 2 : 0) + dateW - dateText.count) + dateText, done ? Gruv.gray : dateColor)
 
-            var repStyled = ""
             if l.repW > 0 {
                 let label = l.shortRepeat ? Recur.short(r) : Recur.describe(r)
                 let text = label.map { ("↻ " + $0).fit(l.repW) } ?? sp(l.repW)
-                repStyled = sp(2) + paint(text, done ? Gruv.gray : Gruv.aqua)
+                cs += cells(sp(2) + text, done ? Gruv.gray : Gruv.aqua)
             }
 
-            var listStyled = ""
             if l.listW > 0 {
                 let name = (r.calendar?.title ?? "").fit(l.listW)
-                listStyled = sp(2) + paint(name, done ? Gruv.gray : color(for: r.calendar))
+                cs += cells(sp(2) + name, done ? Gruv.gray : color(for: r.calendar))
             }
-            return marker + check + prioPart + titleStyled + dateStyled + repStyled + listStyled
+
+            if let sy = syncP {
+                // Arrival: a █▓▒░ scanner wipes the row in, the text cools
+                // from hot aqua, and a second bright band sweeps across.
+                let tw = clamp01(sy / 0.25), x = Ease.out(tw) * Double(cs.count + 4)
+                let heat = sy < 0.25 ? 1 : 1 - Ease.out((sy - 0.25) / 0.75)
+                let bt = (sy - 0.35) / 0.4, xb = -6 + bt * Double(cs.count + 12)
+                let wipe: [Character] = ["█", "▓", "▒", "░"]
+                for k in cs.indices {
+                    let kd = Double(k)
+                    if tw < 1 && kd > x { cs[k].ch = " "; continue }
+                    if tw < 1 && kd > x - 4 {
+                        cs[k] = Cell(ch: wipe[min(3, Int(x - kd))], color: Gruv.aqua)
+                        continue
+                    }
+                    cs[k].color = cs[k].color.mix(Gruv.glow, heat * 0.9)
+                    if bt > 0 && bt < 1 {
+                        cs[k].color = cs[k].color.mix(Gruv.fg0, max(0, 1 - abs(kd - xb) / 4))
+                    }
+                }
+            }
+            if let f = progress(it.id, .fadeOut, at: t) {
+                let e = Ease.out(f)
+                for k in cs.indices { cs[k].color = cs[k].color.mix(Gruv.bg0, e) }
+            }
+            return paintCells(cs)
         }
     }
 }
@@ -1547,7 +1848,7 @@ func start() {
 
     // Live sync: changes from Reminders.app / iCloud / other devices.
     NotificationCenter.default.addObserver(forName: .EKEventStoreChanged, object: store, queue: .main) { _ in
-        a.reload()
+        a.reload(syncing: true)
     }
     // Periodic refresh so "overdue" and day boundaries stay correct.
     let tick = DispatchSource.makeTimerSource(queue: .main)
